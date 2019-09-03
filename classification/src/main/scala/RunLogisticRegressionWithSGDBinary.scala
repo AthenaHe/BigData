@@ -1,28 +1,25 @@
-import org.apache.spark.SparkConf
-import org.apache.spark.SparkContext
-import org.apache.spark.SparkContext._
+import org.apache.spark.mllib.classification.{LogisticRegressionModel, LogisticRegressionWithSGD}
 import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+import org.apache.spark.mllib.feature.StandardScaler
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.DecisionTree
-import org.apache.spark.mllib.tree.impurity.Impurity
-import org.apache.spark.mllib.tree.model.DecisionTreeModel
-import org.apache.spark.rdd._
-import org.apache.spark.storage.StorageLevel
+import org.apache.spark.rdd.RDD
+import org.apache.spark.{SparkConf, SparkContext}
 import org.jfree.data.category.DefaultCategoryDataset
 import org.joda.time.{DateTime, Duration}
 
 /**
   * author: hehuan
-  * date: 2019/9/1 20:24
+  * date: 2019/9/2 15:37
   */
-object RunDecisionTreeBinary {
+//预测准确度只有0.5,可能是程序逻辑有问题！后续再解决
+object RunLogisticRegressionWithSGDBinary {
   def main(args: Array[String]): Unit = {
     //不显示日志信息
     SetLog.SetLogger
 
     println("==============数据准备阶段============")
-    val sc = new SparkContext(new SparkConf().setAppName("DecisionTreeBinary").setMaster("local[*]"))
+    val sc = new SparkContext(new SparkConf().setAppName("LogisticRegressionWithSGDBinary").setMaster("local[*]"))
     val (trainData,validationData,testData,categoriesMap) = PrePareData(sc)
     trainData.persist(); validationData.persist();testData.persist()
 
@@ -53,13 +50,11 @@ object RunDecisionTreeBinary {
     trainData.unpersist();validationData.unpersist();testData.unpersist()
 
   }
-
-
-//一、数据准备阶段
+  //一、数据准备阶段
   def PrePareData(sc: SparkContext):(RDD[LabeledPoint],RDD[LabeledPoint],RDD[LabeledPoint],Map[String,Int])={
     //---------------1.导入/转换数据------------------
     println("开始导入数据。。。")
-      val rawDataWithHeader = sc.textFile("/Users/hehuan/IdeaProjects/Classification/classification/src/main/resources/train.tsv")
+    val rawDataWithHeader = sc.textFile("/Users/hehuan/IdeaProjects/Classification/classification/src/main/resources/train.tsv")
     //train.scv第一行是字段名，需要删除第一行表头
     val rawData = rawDataWithHeader.mapPartitionsWithIndex{
       (idx,iter)=>if(idx==0) iter.drop(1) else iter}
@@ -86,6 +81,11 @@ object RunDecisionTreeBinary {
       LabeledPoint(label,Vectors.dense(categoryFeaturesArray++numericalFeatures))
 
     }
+    //进行数据标准化
+      val featuresData = labelpointRDD.map(labelpoint=>labelpoint.features)
+      println(featuresData.first())
+    val stdScaler = new StandardScaler(true,true).fit(featuresData)
+    val scaledRDD = labelpointRDD.map(labelpoint=>LabeledPoint(labelpoint.label,stdScaler.transform(labelpoint.features)))
 
     //---------------3.以随机方式将数据分为3个部分返回-------------
     val Array(trainData,validationData,testData)=
@@ -95,28 +95,29 @@ object RunDecisionTreeBinary {
   }
 
   //二、训练阶段
-  def trainEvaluation(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint]):DecisionTreeModel={
+  def trainEvaluation(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint]):LogisticRegressionModel={
     println("开始训练。。。。。")
-    val (model,time) = trainModel(trainData,"entropy",10,10)
+    val (model,time) = trainModel(trainData,5,10,1)
     println("训练完成。。。。\n 所需时间："+time+"毫秒！")
     val AUC = evaluateModel(model,validationData)
     println("评估结果AUC="+AUC)
     (model)
   }
   //训练模型
-  def trainModel(trainData: RDD[LabeledPoint], impurity: String, maxDepth: Int, maxBins: Int):(DecisionTreeModel,Double)={
-   val startTime = new DateTime()
-   val model = DecisionTree.trainClassifier(trainData,2,Map[Int,Int](),impurity,maxDepth,maxBins)
-   val endTime = new DateTime()
-   val duration = new Duration(startTime,endTime)
+  def trainModel(trainData: RDD[LabeledPoint], numIterations: Int, stepSize:Double,miniBatchFraction:Double):(LogisticRegressionModel,Double)={
+  val startTime = new DateTime()
+    val model = LogisticRegressionWithSGD.train(trainData,numIterations,stepSize,miniBatchFraction)
+    val endTime = new DateTime()
+    val duration = new Duration(startTime,endTime)
     (model,duration.getMillis()
     )
   }
 
+
   //测试评估
-  def evaluateModel(model: DecisionTreeModel, validationData: RDD[LabeledPoint]):(Double)={
+  def evaluateModel(model: LogisticRegressionModel, validationData: RDD[LabeledPoint]):(Double)={
     val scoreAndLabels = validationData.map{ data=>
-    var predict = model.predict(data.features)
+      var predict = model.predict(data.features)
       (predict,data.label)
     }
     val Metrics = new BinaryClassificationMetrics(scoreAndLabels)
@@ -125,7 +126,7 @@ object RunDecisionTreeBinary {
   }
 
   //四、预测阶段
-  def PredictData(sc: SparkContext, model: DecisionTreeModel, categoriesMap: Map[String, Int])={
+  def PredictData(sc: SparkContext, model: LogisticRegressionModel, categoriesMap: Map[String, Int])={
     //------------1.导入/转换数据--------------
     val rawDataWithHeader = sc.textFile("/Users/hehuan/IdeaProjects/Classification/classification/src/main/resources/test.tsv")
     val rawData = rawDataWithHeader.mapPartitionsWithIndex{
@@ -158,47 +159,48 @@ object RunDecisionTreeBinary {
     }
   }
 
- //参数校调
-  def parametersTunning(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint]):DecisionTreeModel={
-    println("-----评估Impurity参数使用gini，entropy----------")
-    evaluateParameter(trainData,validationData,"impurity",Array("gini","entropy"),Array(10),Array(10))
-    println("------评估MaxDepth参数使用(3,5,10,15,20)----------")
-    evaluateParameter(trainData,validationData,"maxDepth",Array("gini"),Array(3,5,10,15,20),Array(10))
-    println("-----评估maxBins参数使用(3,5,10,50,100)-----------")
-    evaluateParameter(trainData,validationData,"maxBins",Array("gini"),Array(10),Array(3,5,10,50,100,200))
+  //参数校调
+  def parametersTunning(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint]):LogisticRegressionModel={
+    println("-----评估numIterations参数使用5，10，20，60，100----------")
+    evaluateParameter(trainData,validationData,"numIterations",Array(5,15,20,60,100),Array(100),Array(1))
+    println("------评估stepSize参数使用(10,50,100,200)----------")
+    evaluateParameter(trainData,validationData,"stepSize",Array(100),Array(10,50,100,200),Array(1))
+    println("-----评估miniBatchFraction参数使用(0.5,0.8,1)-----------")
+    evaluateParameter(trainData,validationData,"miniBatchFraction",Array(100),Array(100),Array(0.5,0.8,1))
     println("------所有参数交叉评估找出最优参数组合--------------")
-    val bestModel = evaluateAllParameter(trainData,validationData,Array("gini","entropy"),Array(3,5,19,15,20),Array(3,5,10,50,100,200))
+    val bestModel = evaluateAllParameter(trainData,validationData,Array(5,15,20,60,100),Array(10,50,100,200),Array(0.5,0.8,1))
     (bestModel)
   }
 
-  def evaluateParameter(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint], evaluateParameter: String, impurityArray: Array[String], maxDepthArray: Array[Int], maxBinsArray: Array[Int])={
+  def evaluateParameter(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint], evaluateParameter: String, numIterationsArray: Array[Int], stepSizeArray: Array[Double], miniBatchFractionArray: Array[Double])={
     val dataBarChart = new DefaultCategoryDataset()
     val dataLineChart = new DefaultCategoryDataset()
-    for (impurity<-impurityArray;maxDepth<-maxDepthArray;maxBins<-maxBinsArray){
-      val (model,time) = trainModel(trainData,impurity,maxDepth,maxBins)
+    for (numIterations<-numIterationsArray;stepSize<-stepSizeArray;miniBatchFraction<-miniBatchFractionArray){
+      val (model,time) = trainModel(trainData,numIterations,stepSize,miniBatchFraction)
       val auc = evaluateModel(model,validationData)
       val parameterData =
         evaluateParameter match{
-          case "impurity"=>impurity;
-          case "maxDepth"=>maxDepth;
-          case "maxBins"=>maxBins;
+          case "numIterations"=>numIterations;
+          case "stepSize"=>stepSize;
+          case "miniBatchFraction"=>miniBatchFraction;
         }
       dataBarChart.addValue(auc,evaluateParameter,parameterData.toString())
       dataLineChart.addValue(time,"Time",parameterData.toString())
     }
-    Chart.plotBarLineChart("DecisionTree evaluations "+evaluateParameter,evaluateParameter,"AUC",0.58,0.7,"Time",dataBarChart,dataLineChart)
+    Chart.plotBarLineChart("LogisticRegressionWithSGDBinary evaluations "+evaluateParameter,evaluateParameter,"AUC",0.58,0.7,"Time",dataBarChart,dataLineChart)
   }
 
-  def evaluateAllParameter(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint], impurityArray: Array[String], maxDepthArray: Array[Int], maxBinsArray: Array[Int]):DecisionTreeModel={
+  def evaluateAllParameter(trainData: RDD[LabeledPoint], validationData: RDD[LabeledPoint], numIterationsArray: Array[Int], stepSizeArray: Array[Double], miniBatchFractionArray: Array[Double])={
     val evaluationsArray =
-      for (impurity<-impurityArray;maxDepth<-maxDepthArray;maxBins<-maxBinsArray) yield {
-        val (model,time) = trainModel(trainData,impurity,maxDepth,maxBins)
+      for (numIterations<-numIterationsArray;stepSize<-stepSizeArray;miniBatchFraction<-miniBatchFractionArray) yield {
+        val (model,time) = trainModel(trainData,numIterations,stepSize,miniBatchFraction)
         val auc = evaluateModel(model,validationData)
-        (impurity,maxDepth,maxBins,auc)
+        (numIterations,stepSize,miniBatchFraction,auc)
       }
     val BestEval =(evaluationsArray.sortBy(_._4).reverse)(0)
-    println("调校后最佳参数：impurity:"+BestEval._1+",maxDepth:"+BestEval._2+",maxBins"+BestEval._3+",结果AUC="+BestEval._4)
+    println("调校后最佳参数：numIterations:"+BestEval._1+",stepSize:"+BestEval._2+",miniBatchFraction:"+BestEval._3+",结果AUC="+BestEval._4)
     val (bestModel,time) = trainModel(trainData.union(validationData),BestEval._1,BestEval._2,BestEval._3)
     (bestModel)
   }
+
 }
